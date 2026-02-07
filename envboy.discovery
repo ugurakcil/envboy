@@ -49,8 +49,9 @@ MODEL="$(awk -F: '/model name/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo
 [ -z "$MODEL" ] && MODEL="$(awk -F: '/Hardware|Model/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
 kv "CPU" "${MODEL:-?} | vCPU=${VCPU}"
 kv "Load avg" "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo "?")"
+# fix: avoid reporting ps itself (and reduce weird 100% artifacts)
 kv "Top CPU procs" "$(ps -eo pid,comm,pcpu --sort=-pcpu --no-headers 2>/dev/null \
-  | awk -v me="$SELF" '($1!=me && NR<=6){printf "%s(%.1f%%) ",$2,$3} END{print ""}')"
+  | awk -v me="$SELF" '($1!=me && $2!="ps" && NR<=12){printf "%s(%.1f%%) ",$2,$3; c++} END{if(c==0) print "-"; else print ""}')"
 
 # ---------- MEMORY ----------
 section "MEMORY"
@@ -130,13 +131,27 @@ AK_LINES=0
 if [ -f "$AK" ]; then AK_LINES="$(wc -l <"$AK" | tr -d ' ' || echo 0)"; fi
 kv "Root auth_keys" "${AK_LINES} ($( [ -f "$AK" ] && echo present || echo missing ))"
 
+# fix: ensure every kv gets exactly 2 args; never print "?" lines
 if need sshd && sshd -T >/dev/null 2>&1; then
-  kv "SSH port" "$(sshd -T | awk '$1=="port"{print $2; exit}' || echo "?")"
-  kv "PermitRootLogin" "$(sshd -T | awk '$1=="permitrootlogin"{print $2; exit}' || echo "?")"
-  kv "PasswordAuth" "$(sshd -T | awk '$1=="passwordauthentication"{print $2; exit}' || echo "?")"
-  kv "PubkeyAuth" "$(sshd -T | awk '$1=="pubkeyauthentication"{print $2; exit}' || echo "?")"
-  kv "KbdInteractive" "$(sshd -T | awk '$1=="kbdinteractiveauthentication"{print $2; exit}' || echo "?")"
-  kv "AllowUsers" "$(sshd -T | awk '$1=="allowusers"{for(i=2;i<=NF;i++) printf "%s ",$i; exit}' || echo "-")"
+  SSH_PORT="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+  PRL="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}')"
+  PWA="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}')"
+  PKA="$(sshd -T 2>/dev/null | awk '$1=="pubkeyauthentication"{print $2; exit}')"
+  KIA="$(sshd -T 2>/dev/null | awk '$1=="kbdinteractiveauthentication"{print $2; exit}')"
+  ALU="$(sshd -T 2>/dev/null | awk '$1=="allowusers"{for(i=2;i<=NF;i++) printf "%s ",$i; exit}')"
+  kv "SSH port" "${SSH_PORT:-?}"
+  kv "PermitRootLogin" "${PRL:-?}"
+  kv "PasswordAuth" "${PWA:-?}"
+  kv "PubkeyAuth" "${PKA:-?}"
+  kv "KbdInteractive" "${KIA:-?}"
+  kv "AllowUsers" "${ALU:-none}"
+else
+  kv "SSH port" "-"
+  kv "PermitRootLogin" "-"
+  kv "PasswordAuth" "-"
+  kv "PubkeyAuth" "-"
+  kv "KbdInteractive" "-"
+  kv "AllowUsers" "-"
 fi
 
 # firewall presence/status
@@ -165,27 +180,46 @@ fi
 kv "SSH fails (24h)" "${FAIL_24H:--}"
 kv "Top src IPs" "${TOP_IPS:--}"
 
-# current ssh clients (max 2) for allowlisting
-SSH_CLIENTS="$(ss -tnp 2>/dev/null | awk '/:22 / && /sshd/ {print $5}' | sed 's/::ffff://g' | cut -d: -f1 | sort -u | head -n 2 | tr '\n' ' ')"
-kv "SSH clients" "${SSH_CLIENTS:-none}"
+# current ssh clients (max 2) for allowlisting (guard if ss missing)
+if need ss; then
+  SSH_CLIENTS="$(ss -tnp 2>/dev/null | awk '/:22 / && /sshd/ {print $5}' | sed 's/::ffff://g' | cut -d: -f1 | sort -u | head -n 2 | tr '\n' ' ')"
+  kv "SSH clients" "${SSH_CLIENTS:-none}"
+else
+  kv "SSH clients" "-"
+fi
 
-# fail2ban/crowdsec status (if present)
+# fix: no stray "-" lines; always one kv per line
 if need systemctl; then
   kv "fail2ban" "$(systemctl is-active fail2ban 2>/dev/null || echo -)"
   kv "crowdsec" "$(systemctl is-active crowdsec 2>/dev/null || echo -)"
+else
+  kv "fail2ban" "-"
+  kv "crowdsec" "-"
 fi
 
 # ---------- SYSTEM (touchpoints) ----------
 section "SYSTEM (touchpoints)"
 if need systemctl; then
-  kv "Failed services" "$(systemctl list-units --failed --no-pager 2>/dev/null | awk '$1 ~ /\.service$/ {c++} END{print c+0}')"
+  FAILED_SVC="$(systemctl list-units --failed --no-pager 2>/dev/null | awk '$1 ~ /\.service$/ {c++} END{print c+0}')"
   FNAMES="$(systemctl list-units --failed --no-pager 2>/dev/null | awk '$1 ~ /\.service$/ {print $1}' | head -n 6 | tr '\n' ' ')"
+  kv "Failed services" "${FAILED_SVC:-0}"
   kv "Failed names" "${FNAMES:-none}"
 
-  kv "cloud-init" "$(systemctl is-active cloud-init 2>/dev/null || echo -)"
-  kv "wait-online" "$(systemctl is-active systemd-networkd-wait-online 2>/dev/null || echo -)"
-  kv "NM active" "$(systemctl is-active NetworkManager 2>/dev/null || echo -)"
-  kv "networkd active" "$(systemctl is-active systemd-networkd 2>/dev/null || echo -)"
+  CI_STATE="$(systemctl is-active cloud-init 2>/dev/null || echo -)"
+  WO_STATE="$(systemctl is-active systemd-networkd-wait-online 2>/dev/null || echo -)"
+  NM_STATE="$(systemctl is-active NetworkManager 2>/dev/null || echo -)"
+  ND_STATE="$(systemctl is-active systemd-networkd 2>/dev/null || echo -)"
+  kv "cloud-init" "$CI_STATE"
+  kv "wait-online" "$WO_STATE"
+  kv "NM active" "$NM_STATE"
+  kv "networkd active" "$ND_STATE"
+else
+  kv "Failed services" "-"
+  kv "Failed names" "-"
+  kv "cloud-init" "-"
+  kv "wait-online" "-"
+  kv "NM active" "-"
+  kv "networkd active" "-"
 fi
 
 kv "Netplan files" "$(ls -1 /etc/netplan/*.yaml 2>/dev/null | wc -l | tr -d ' ')"
@@ -193,6 +227,8 @@ kv "cloud cfg.d" "$(ls -1 /etc/cloud/cloud.cfg.d/*.cfg 2>/dev/null | wc -l | tr 
 
 if need timedatectl; then
   kv "Time sync" "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo -)"
+else
+  kv "Time sync" "-"
 fi
 
 if need apt-get; then
@@ -203,6 +239,10 @@ if need apt-get; then
   else
     kv "Reboot pkgs" "-"
   fi
+else
+  kv "APT upgrades" "-"
+  kv "Reboot req" "-"
+  kv "Reboot pkgs" "-"
 fi
 
 # ---------- FLAGS ----------
@@ -213,26 +253,24 @@ ROOT_USE="$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5+0}' || ec
 [ "$ROOT_USE" -ge 90 ] && FLAGS+=("DISK_CRITICAL(root=${ROOT_USE}%)")
 
 if need sshd && sshd -T >/dev/null 2>&1; then
-  PRL="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}' || echo "-")"
-  PWA="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}' || echo "-")"
-  [ "$PRL" = "yes" ] && FLAGS+=("SSH_ROOT_LOGIN_ENABLED")
-  [ "$PWA" = "yes" ] && FLAGS+=("SSH_PASSWORD_AUTH_ENABLED")
+  PRL2="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}' || echo "-")"
+  PWA2="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}' || echo "-")"
+  [ "$PRL2" = "yes" ] && FLAGS+=("SSH_ROOT_LOGIN_ENABLED")
+  [ "$PWA2" = "yes" ] && FLAGS+=("SSH_PASSWORD_AUTH_ENABLED")
 fi
 
 if [[ "${FAIL_24H:-0}" =~ ^[0-9]+$ ]] && [ "${FAIL_24H:-0}" -ge 1000 ]; then
   FLAGS+=("SSH_BRUTEFORCE_SUSPECT(fails24h=${FAIL_24H})")
 fi
 
-if [ -f /var/run/reboot-required ]; then FLAGS+=("REBOOT_REQUIRED"); fi
-if [ -f "$AK" ] && [ "$AK_LINES" -eq 0 ]; then FLAGS+=("ROOT_AUTH_KEYS_EMPTY(lockout_risk)"); fi
+[ -f /var/run/reboot-required ] && FLAGS+=("REBOOT_REQUIRED")
+[ -f "$AK" ] && [ "$AK_LINES" -eq 0 ] && FLAGS+=("ROOT_AUTH_KEYS_EMPTY(lockout_risk)")
 
 if need systemctl; then
-  FCT="$(systemctl list-units --failed --no-pager 2>/dev/null | awk '$1 ~ /\.service$/ {c++} END{print c+0}')"
-  [ "$FCT" -gt 0 ] && FLAGS+=("FAILED_UNITS(n=$FCT)")
-  [ "$(systemctl is-active cloud-init 2>/dev/null || echo -)" = "failed" ] && FLAGS+=("CLOUD_INIT_FAILED")
-  [ "$(systemctl is-active systemd-networkd-wait-online 2>/dev/null || echo -)" = "failed" ] && FLAGS+=("WAIT_ONLINE_FAILED")
+  [ "${FAILED_SVC:-0}" -gt 0 ] && FLAGS+=("FAILED_UNITS(n=${FAILED_SVC})")
+  [ "${CI_STATE:-}" = "failed" ] && FLAGS+=("CLOUD_INIT_FAILED")
+  [ "${WO_STATE:-}" = "failed" ] && FLAGS+=("WAIT_ONLINE_FAILED")
 fi
 
 kv "Flags" "$(printf "%s " "${FLAGS[@]:-OK}" | sed 's/ *$//')"
-
 section "DONE"
