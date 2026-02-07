@@ -3,7 +3,7 @@ set -euo pipefail
 
 # envboy.discovery (root-only)
 # Compact, LLM-friendly discovery for common Linux servers (Ubuntu/Debian first, best-effort elsewhere).
-# Focus: baseline environment + "starter touchpoints" (ssh/firewall/network stack/updates/time sync).
+# No side effects. Robust under set -euo pipefail. No stray "-" lines.
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: run as root (use: sudo envboy.discovery)" >&2
@@ -11,28 +11,40 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 section(){ printf "\n== %s ==\n" "$1"; }
-kv(){ printf "%-22s %s\n" "$1" "$2"; }
+kv(){ printf "%-22s %s\n" "$1" "${2:-}"; }
 need(){ command -v "$1" >/dev/null 2>&1; }
 ts(){ date -Is 2>/dev/null || date 2>/dev/null || echo "?"; }
 to_gib(){ awk -v b="${1:-0}" 'BEGIN{ if(b==0){printf "0.00Gi"; exit} printf "%.2fGi", b/1024/1024/1024 }'; }
+
+# return "active/inactive/failed/..." even if systemctl uses nonzero rc for non-active states
+sys_active(){
+  local s=""
+  if need systemctl; then
+    set +e
+    s="$(systemctl is-active "$1" 2>/dev/null)"
+    set -e
+    [ -n "$s" ] && { echo "$s"; return; }
+  fi
+  echo "-"
+}
 
 SELF="$$"
 
 # ---------- BASIC ----------
 section "BASIC"
 kv "Timestamp" "$(ts)"
-kv "Hostname" "$( (hostnamectl --static 2>/dev/null || hostname 2>/dev/null) | head -n1 )"
+kv "Hostname" "$( (hostnamectl --static 2>/dev/null || hostname 2>/dev/null || echo "?") | head -n1 )"
 
-OS_PRETTY=""
+OS_PRETTY="?"
 if [ -r /etc/os-release ]; then
-  OS_PRETTY="$(. /etc/os-release; echo "${PRETTY_NAME:-${NAME:-}}")"
+  OS_PRETTY="$(. /etc/os-release; echo "${PRETTY_NAME:-${NAME:-?}}")"
 fi
-kv "OS" "${OS_PRETTY:-?}"
+kv "OS" "$OS_PRETTY"
 kv "Kernel" "$(uname -srmo 2>/dev/null || uname -a 2>/dev/null || echo "?")"
 kv "MachineID" "$(cat /etc/machine-id 2>/dev/null || echo "-")"
 kv "BootID" "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "-")"
 kv "Uptime" "$(uptime -p 2>/dev/null || (awk '{print int($1)"s"}' /proc/uptime 2>/dev/null) || echo "?")"
-kv "Timezone" "$( (timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null) | head -n1 )"
+kv "Timezone" "$( (timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "?") | head -n1 )"
 
 VIRT="unknown"
 if need systemd-detect-virt; then
@@ -49,9 +61,13 @@ MODEL="$(awk -F: '/model name/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo
 [ -z "$MODEL" ] && MODEL="$(awk -F: '/Hardware|Model/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
 kv "CPU" "${MODEL:-?} | vCPU=${VCPU}"
 kv "Load avg" "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo "?")"
-# fix: avoid reporting ps itself (and reduce weird 100% artifacts)
-kv "Top CPU procs" "$(ps -eo pid,comm,pcpu --sort=-pcpu --no-headers 2>/dev/null \
-  | awk -v me="$SELF" '($1!=me && $2!="ps" && NR<=12){printf "%s(%.1f%%) ",$2,$3; c++} END{if(c==0) print "-"; else print ""}')"
+kv "Top CPU procs" "$(
+  ps -eo pid,comm,pcpu --sort=-pcpu --no-headers 2>/dev/null \
+  | awk -v me="$SELF" '
+      $1!=me && $2!="ps" && NR<=12 { printf "%s(%.1f%%) ", $2, $3; c++ }
+      END { if(c==0) printf "none"; print "" }
+    ' | sed 's/[[:space:]]*$//'
+)"
 
 # ---------- MEMORY ----------
 section "MEMORY"
@@ -61,11 +77,15 @@ if need free; then
   kv "Mem used/total" "$(to_gib "$mu")/$(to_gib "$mt") (avail $(to_gib "$ma"))"
   kv "Swap used/total" "$(to_gib "$su")/$(to_gib "$st")"
 else
-  kv "Mem" "free(1) not found"
+  kv "Mem used/total" "-"
+  kv "Swap used/total" "-"
 fi
 
-kv "Top RSS procs" "$(ps -eo pid,comm,rss --sort=-rss --no-headers 2>/dev/null \
-  | awk -v me="$SELF" '($1!=me && NR<=6){printf "%s(%.0fMB) ",$2,$3/1024} END{print ""}')"
+kv "Top RSS procs" "$(
+  ps -eo pid,comm,rss --sort=-rss --no-headers 2>/dev/null \
+  | awk -v me="$SELF" '($1!=me && NR<=6){printf "%s(%.0fMB) ",$2,$3/1024} END{print ""}' \
+  | sed 's/[[:space:]]*$//'
+)"
 
 if need journalctl; then
   kv "OOM kills (boot)" "$(journalctl -k -b 0 --no-pager 2>/dev/null | grep -E "Out of memory|Killed process" | wc -l | tr -d ' ')"
@@ -75,22 +95,25 @@ fi
 
 # ---------- DISK & FS ----------
 section "DISK & FS"
-ROOT_LINE="$(df -hPT / 2>/dev/null | awk 'NR==2{print}')"
-if [ -n "$ROOT_LINE" ]; then
-  kv "Root FS" "$(echo "$ROOT_LINE" | awk '{print $1" "$2" size="$3" used="$4" avail="$5" use="$6" mount="$7}')"
+ROOT_LINE="$(df -hPT / 2>/dev/null | awk 'NR==2{print}' || true)"
+if [ -n "${ROOT_LINE:-}" ]; then
+  kv "Root FS" "$(awk '{print $1" "$2" size="$3" used="$4" avail="$5" use="$6" mount="$7}' <<<"$ROOT_LINE")"
 else
-  ROOT_LINE="$(df -hP / 2>/dev/null | awk 'NR==2{print}')"
-  kv "Root FS" "$(echo "$ROOT_LINE" | awk '{print $1" size="$2" used="$3" avail="$4" use="$5" mount="$6}')"
+  ROOT_LINE="$(df -hP / 2>/dev/null | awk 'NR==2{print}' || true)"
+  kv "Root FS" "$(awk '{print $1" size="$2" used="$3" avail="$4" use="$5" mount="$6}' <<<"$ROOT_LINE")"
 fi
 
 kv "Root use%" "$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5+0}' || echo "?")"
 
-TOPM="$(df -hPT 2>/dev/null | awk 'NR==1{next} NR<=7{printf "%s:%s:%s ",$7,$2,$6} END{print ""}')"
-[ -z "$TOPM" ] && TOPM="$(df -hP 2>/dev/null | awk 'NR==1{next} NR<=7{printf "%s:%s ",$6,$5} END{print ""}')"
-kv "Top mounts" "${TOPM:-?}"
+TOPM="$(df -hPT 2>/dev/null | awk 'NR==1{next} NR<=7{printf "%s:%s:%s ",$7,$2,$6} END{print ""}' || true)"
+[ -z "${TOPM:-}" ] && TOPM="$(df -hP 2>/dev/null | awk 'NR==1{next} NR<=7{printf "%s:%s ",$6,$5} END{print ""}' || true)"
+kv "Top mounts" "$(echo "${TOPM:-?}" | sed 's/[[:space:]]*$//')"
 
 kv "Inodes /" "$(df -ih / 2>/dev/null | awk 'NR==2{print "used="$5" ("$3"/"$2")"}' || echo "?")"
-kv "Big dirs /var" "$(du -xsh /var/* 2>/dev/null | sort -h | tail -n 5 | awk '{printf "%s:%s ",$2,$1} END{print ""}' || echo "?")"
+kv "Big dirs /var" "$(
+  du -xsh /var/* 2>/dev/null | sort -h | tail -n 5 | awk '{printf "%s:%s ",$2,$1} END{print ""}' \
+  | sed 's/[[:space:]]*$//'
+)"
 
 # ---------- NETWORK ----------
 section "NETWORK"
@@ -103,47 +126,52 @@ else
 fi
 
 if need resolvectl; then
-  kv "DNS" "$(resolvectl dns 2>/dev/null | awk 'NR==1{next} {printf "%s ",$0}' | sed 's/  */ /g' | head -c 220)"
+  kv "DNS" "$(resolvectl dns 2>/dev/null | awk 'NR==1{next} {printf "%s ",$0}' | sed 's/  */ /g' | cut -c1-220 || true)"
 elif [ -r /etc/resolv.conf ]; then
-  kv "DNS" "$(grep -E '^\s*nameserver\s+' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ' | head -c 220)"
+  kv "DNS" "$(grep -E '^\s*nameserver\s+' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ' | cut -c1-220 || true)"
 else
   kv "DNS" "-"
 fi
 
 if need ss; then
-  kv "ss summary" "$(ss -s 2>/dev/null | tr '\n' '; ' | head -c 240)"
-  kv "Listening" "$(ss -lntupH 2>/dev/null | awk '
-    {
-      proto=$1; la=$5; port=la; sub(/.*:/,"",port);
-      proc=$7; gsub(/users:\(\(|\)\)|"|,fd=[0-9]+/,"",proc);
-      if (match(proc, /([A-Za-z0-9_.-]+),pid=/, m)) p=m[1]; else p="-";
-      printf "%s:%s(%s)\n", proto, port, p
-    }' | sort -u | head -n 12 | tr "\n" " ")"
+  kv "ss summary" "$(ss -s 2>/dev/null | tr '\n' '; ' | cut -c1-240 || true)"
+  kv "Listening" "$(
+    ss -lntupH 2>/dev/null | awk '
+      {
+        proto=$1; la=$5; port=la; sub(/.*:/,"",port);
+        proc=$7; gsub(/users:\(\(|\)\)|"|,fd=[0-9]+/,"",proc);
+        if (match(proc, /([A-Za-z0-9_.-]+),pid=/, m)) p=m[1]; else p="-";
+        printf "%s:%s(%s)\n", proto, port, p
+      }' | sort -u | head -n 12 | tr "\n" " " | sed 's/[[:space:]]*$//'
+  )"
 else
-  kv "ss summary" "ss(8) not found"
+  kv "ss summary" "-"
   kv "Listening" "-"
 fi
 
-# ---------- SECURITY (touchpoints) ----------
+# ---------- SECURITY ----------
 section "SECURITY (touchpoints)"
 AK="/root/.ssh/authorized_keys"
 AK_LINES=0
 if [ -f "$AK" ]; then AK_LINES="$(wc -l <"$AK" | tr -d ' ' || echo 0)"; fi
 kv "Root auth_keys" "${AK_LINES} ($( [ -f "$AK" ] && echo present || echo missing ))"
 
-# fix: ensure every kv gets exactly 2 args; never print "?" lines
-if need sshd && sshd -T >/dev/null 2>&1; then
-  SSH_PORT="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
-  PRL="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}')"
-  PWA="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}')"
-  PKA="$(sshd -T 2>/dev/null | awk '$1=="pubkeyauthentication"{print $2; exit}')"
-  KIA="$(sshd -T 2>/dev/null | awk '$1=="kbdinteractiveauthentication"{print $2; exit}')"
-  ALU="$(sshd -T 2>/dev/null | awk '$1=="allowusers"{for(i=2;i<=NF;i++) printf "%s ",$i; exit}')"
-  kv "SSH port" "${SSH_PORT:-?}"
-  kv "PermitRootLogin" "${PRL:-?}"
-  kv "PasswordAuth" "${PWA:-?}"
-  kv "PubkeyAuth" "${PKA:-?}"
-  kv "KbdInteractive" "${KIA:-?}"
+SSHD_T=""
+SSHD_T_RC=1
+if need sshd; then
+  set +e
+  SSHD_T="$(sshd -T 2>/dev/null)"
+  SSHD_T_RC=$?
+  set -e
+fi
+
+if [ "$SSHD_T_RC" -eq 0 ] && [ -n "$SSHD_T" ]; then
+  kv "SSH port" "$(awk '$1=="port"{print $2; exit}' <<<"$SSHD_T")"
+  kv "PermitRootLogin" "$(awk '$1=="permitrootlogin"{print $2; exit}' <<<"$SSHD_T")"
+  kv "PasswordAuth" "$(awk '$1=="passwordauthentication"{print $2; exit}' <<<"$SSHD_T")"
+  kv "PubkeyAuth" "$(awk '$1=="pubkeyauthentication"{print $2; exit}' <<<"$SSHD_T")"
+  kv "KbdInteractive" "$(awk '$1=="kbdinteractiveauthentication"{print $2; exit}' <<<"$SSHD_T")"
+  ALU="$(awk '$1=="allowusers"{for(i=2;i<=NF;i++) printf "%s ",$i; exit}' <<<"$SSHD_T")"
   kv "AllowUsers" "${ALU:-none}"
 else
   kv "SSH port" "-"
@@ -154,17 +182,20 @@ else
   kv "AllowUsers" "-"
 fi
 
-# firewall presence/status
 if need ufw; then
-  kv "UFW" "$(ufw status 2>/dev/null | head -n 2 | tr '\n' '; ')"
+  kv "UFW" "$(ufw status 2>/dev/null | head -n 2 | tr '\n' '; ' || true)"
 elif need firewall-cmd; then
   kv "firewalld" "$(firewall-cmd --state 2>/dev/null || echo "?")"
 else
   kv "Firewall" "no ufw/firewalld"
 fi
-if need nft; then kv "nft ruleset" "$(nft list ruleset 2>/dev/null | wc -l | tr -d ' ') lines"; fi
 
-# ssh brute force (24h) + top IPs (compact)
+if need nft; then
+  kv "nft ruleset" "$(nft list ruleset 2>/dev/null | wc -l | tr -d ' ' || echo 0) lines"
+else
+  kv "nft ruleset" "-"
+fi
+
 FAIL_24H="-"; TOP_IPS="-"
 if need journalctl; then
   FAIL_24H="$(journalctl -u ssh -u sshd --since "-24 hours" --no-pager 2>/dev/null \
@@ -172,58 +203,45 @@ if need journalctl; then
   TOP_IPS="$(journalctl -u ssh -u sshd --since "-24 hours" --no-pager 2>/dev/null \
     | grep -E "Failed password|Invalid user|max auth tries|maximum authentication attempts" \
     | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i}' \
-    | sort | uniq -c | sort -nr | head -n 5 | awk '{printf "%s(%s) ",$2,$1}')"
+    | sort | uniq -c | sort -nr | head -n 5 | awk '{printf "%s(%s) ",$2,$1}' || true)"
 elif [ -r /var/log/auth.log ]; then
   FAIL_24H="$(grep -E "Failed password|Invalid user|max auth tries|maximum authentication attempts" /var/log/auth.log 2>/dev/null \
-    | tail -n 50000 | wc -l | tr -d ' ')"
+    | tail -n 50000 | wc -l | tr -d ' ' || true)"
 fi
 kv "SSH fails (24h)" "${FAIL_24H:--}"
 kv "Top src IPs" "${TOP_IPS:--}"
 
-# current ssh clients (max 2) for allowlisting (guard if ss missing)
 if need ss; then
-  SSH_CLIENTS="$(ss -tnp 2>/dev/null | awk '/:22 / && /sshd/ {print $5}' | sed 's/::ffff://g' | cut -d: -f1 | sort -u | head -n 2 | tr '\n' ' ')"
+  SSH_CLIENTS="$(ss -tnp 2>/dev/null | awk '/:22 / && /sshd/ {print $5}' | sed 's/::ffff://g' | cut -d: -f1 | sort -u | head -n 2 | tr '\n' ' ' || true)"
   kv "SSH clients" "${SSH_CLIENTS:-none}"
 else
   kv "SSH clients" "-"
 fi
 
-# fix: no stray "-" lines; always one kv per line
-if need systemctl; then
-  kv "fail2ban" "$(systemctl is-active fail2ban 2>/dev/null || echo -)"
-  kv "crowdsec" "$(systemctl is-active crowdsec 2>/dev/null || echo -)"
-else
-  kv "fail2ban" "-"
-  kv "crowdsec" "-"
-fi
+kv "fail2ban" "$(sys_active fail2ban)"
+kv "crowdsec" "$(sys_active crowdsec)"
 
-# ---------- SYSTEM (touchpoints) ----------
+# ---------- SYSTEM ----------
 section "SYSTEM (touchpoints)"
 if need systemctl; then
   FAILED_SVC="$(systemctl list-units --failed --no-pager 2>/dev/null | awk '$1 ~ /\.service$/ {c++} END{print c+0}')"
-  FNAMES="$(systemctl list-units --failed --no-pager 2>/dev/null | awk '$1 ~ /\.service$/ {print $1}' | head -n 6 | tr '\n' ' ')"
+  FNAMES="$(systemctl list-units --failed --no-pager 2>/dev/null | awk '$1 ~ /\.service$/ {print $1}' | head -n 6 | tr '\n' ' ' || true)"
+  [ -z "$FNAMES" ] && FNAMES="none"
   kv "Failed services" "${FAILED_SVC:-0}"
-  kv "Failed names" "${FNAMES:-none}"
-
-  CI_STATE="$(systemctl is-active cloud-init 2>/dev/null || echo -)"
-  WO_STATE="$(systemctl is-active systemd-networkd-wait-online 2>/dev/null || echo -)"
-  NM_STATE="$(systemctl is-active NetworkManager 2>/dev/null || echo -)"
-  ND_STATE="$(systemctl is-active systemd-networkd 2>/dev/null || echo -)"
-  kv "cloud-init" "$CI_STATE"
-  kv "wait-online" "$WO_STATE"
-  kv "NM active" "$NM_STATE"
-  kv "networkd active" "$ND_STATE"
+  kv "Failed names" "$FNAMES"
 else
+  FAILED_SVC="0"
   kv "Failed services" "-"
   kv "Failed names" "-"
-  kv "cloud-init" "-"
-  kv "wait-online" "-"
-  kv "NM active" "-"
-  kv "networkd active" "-"
 fi
 
-kv "Netplan files" "$(ls -1 /etc/netplan/*.yaml 2>/dev/null | wc -l | tr -d ' ')"
-kv "cloud cfg.d" "$(ls -1 /etc/cloud/cloud.cfg.d/*.cfg 2>/dev/null | wc -l | tr -d ' ')"
+kv "cloud-init" "$(sys_active cloud-init)"
+kv "wait-online" "$(sys_active systemd-networkd-wait-online)"
+kv "NM active" "$(sys_active NetworkManager)"
+kv "networkd active" "$(sys_active systemd-networkd)"
+
+kv "Netplan files" "$(ls -1 /etc/netplan/*.yaml 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
+kv "cloud cfg.d" "$(ls -1 /etc/cloud/cloud.cfg.d/*.cfg 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
 
 if need timedatectl; then
   kv "Time sync" "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo -)"
@@ -235,7 +253,7 @@ if need apt-get; then
   kv "APT upgrades" "$( (apt-get -s upgrade 2>/dev/null || true) | awk '/^Inst /{c++} END{print c+0}')"
   kv "Reboot req" "$( [ -f /var/run/reboot-required ] && echo yes || echo no )"
   if [ -f /var/run/reboot-required.pkgs ]; then
-    kv "Reboot pkgs" "$(head -n 5 /var/run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ')"
+    kv "Reboot pkgs" "$(head -n 5 /var/run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ' || true)"
   else
     kv "Reboot pkgs" "-"
   fi
@@ -252,9 +270,9 @@ FLAGS=()
 ROOT_USE="$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5+0}' || echo 0)"
 [ "$ROOT_USE" -ge 90 ] && FLAGS+=("DISK_CRITICAL(root=${ROOT_USE}%)")
 
-if need sshd && sshd -T >/dev/null 2>&1; then
-  PRL2="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}' || echo "-")"
-  PWA2="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}' || echo "-")"
+if [ "$SSHD_T_RC" -eq 0 ] && [ -n "$SSHD_T" ]; then
+  PRL2="$(awk '$1=="permitrootlogin"{print $2; exit}' <<<"$SSHD_T")"
+  PWA2="$(awk '$1=="passwordauthentication"{print $2; exit}' <<<"$SSHD_T")"
   [ "$PRL2" = "yes" ] && FLAGS+=("SSH_ROOT_LOGIN_ENABLED")
   [ "$PWA2" = "yes" ] && FLAGS+=("SSH_PASSWORD_AUTH_ENABLED")
 fi
@@ -268,9 +286,14 @@ fi
 
 if need systemctl; then
   [ "${FAILED_SVC:-0}" -gt 0 ] && FLAGS+=("FAILED_UNITS(n=${FAILED_SVC})")
-  [ "${CI_STATE:-}" = "failed" ] && FLAGS+=("CLOUD_INIT_FAILED")
-  [ "${WO_STATE:-}" = "failed" ] && FLAGS+=("WAIT_ONLINE_FAILED")
+  [ "$(sys_active cloud-init)" = "failed" ] && FLAGS+=("CLOUD_INIT_FAILED")
+  [ "$(sys_active systemd-networkd-wait-online)" = "failed" ] && FLAGS+=("WAIT_ONLINE_FAILED")
 fi
 
-kv "Flags" "$(printf "%s " "${FLAGS[@]:-OK}" | sed 's/ *$//')"
+if [ "${#FLAGS[@]}" -eq 0 ]; then
+  kv "Flags" "OK"
+else
+  kv "Flags" "$(printf "%s " "${FLAGS[@]}" | sed 's/[[:space:]]*$//')"
+fi
+
 section "DONE"
